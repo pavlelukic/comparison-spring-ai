@@ -52,4 +52,8 @@ public class ChatMessageRepository {
         Collections.reverse(lastNDescending);
         return lastNDescending;
     }
+
+    public void deleteAllBySessionId(UUID sessionId) {
+        jdbcTemplate.update("DELETE FROM comparison_chat_messages WHERE session_id = ?", sessionId);
+    }
 }
