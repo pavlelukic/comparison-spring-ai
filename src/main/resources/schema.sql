@@ -1,6 +1,7 @@
 CREATE TABLE IF NOT EXISTS comparison_chat_sessions (
     id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     subject_id VARCHAR(255) NOT NULL,
+    lang       VARCHAR(5) NOT NULL DEFAULT 'en',
     created_at TIMESTAMP NOT NULL DEFAULT now(),
     updated_at TIMESTAMP NOT NULL DEFAULT now()
     );
