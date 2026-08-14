@@ -1,17 +1,18 @@
 # Spring AI 1.1.8 vs LangChain4j 1.10.0 — implementation notes
 
 Reimplementation of CorpusAI's RAG chat feature on Spring AI 1.1.8, holding Spring
-Boot 3.5.14, Postgres/pgvector, and the OpenAI models constant. Every class/method
-below was verified against the actual 1.1.8 jars (via `javap`, and in one case
-decompiled bytecode) and/or the 1.1-tagged reference docs
+Boot 3.5.14, Postgres/pgvector, and the OpenAI and Anthropic models constant. Every
+class/method below was verified against the actual 1.1.8 jars (via `javap`, and in
+some cases decompiled bytecode) and/or the 1.1-tagged reference docs
 (`https://docs.spring.io/spring-ai/reference/1.1/...`), not the default (2.0) docs
-and not memory. One obligation's docs page pointed at a wrong/abbreviated package
-for two classes - caught by checking the jar directly (see #7/#8). The full
-pipeline was also run live end-to-end against a real Postgres/pgvector
-container and real OpenAI calls (ingestion, English and Serbian sessions,
-grounded answers, grounded refusal, and a 34-message conversation to exercise
-the memory window) - this caught a real runtime bug in the streaming/usage
-mapping that no amount of signature-checking would have (see #12).
+and not memory. One section's docs page pointed at a wrong/abbreviated package for
+two classes - caught by checking the jar directly (see #7/#8). The full pipeline
+was also run live end-to-end against a real Postgres/pgvector container and real
+OpenAI and Anthropic calls (ingestion, English and Serbian sessions, grounded
+answers, grounded refusal, a 34-message conversation to exercise the memory
+window, and both chat providers streaming side by side) - this caught two real
+runtime bugs in the streaming/usage mapping that no amount of signature-checking
+would have (see #12).
 
 Source files referenced below live under `src/main/java/com/corpusai/comparison_spring_ai/`.
 Every file under the `springai/` subpackage imports `org.springframework.ai.*`;
@@ -55,18 +56,73 @@ from `spring.ai.openai.embedding.options.model`. Zero Java.
 
 - **Direct, less code.** CorpusAI builds this bean explicitly in `ModelFactory`.
 
-## 4. Chat model: gpt-5.4-mini, temperature 0.7, streaming
+## 4. Chat models: OpenAI (gpt-5.4-mini) + Anthropic (claude-haiku-4-5), temperature 0.7, streaming
 
-**Spring AI**: autoconfigured `OpenAiChatModel` from
-`spring.ai.openai.chat.options.{model,temperature}`. Streaming via
-`ChatClient...stream().chatResponse()` → `Flux<ChatResponse>`.
-`OpenAiChatOptions.builder().streamUsage(true)` is set **in code**
+**Spring AI**: both `spring-ai-starter-model-openai` and
+`spring-ai-starter-model-anthropic` autoconfigure their respective `ChatModel`
+beans straight from `application.yml`
+(`spring.ai.{openai,anthropic}.chat.options.{model,temperature}`, plus an
+explicit `max-tokens: 4096` for Anthropic - see below). Streaming via
+`ChatClient...stream().chatResponse()` → `Flux<ChatResponse>` for either
+provider. `OpenAiChatOptions.builder().streamUsage(true)` is set **in code**
 (`springai/chat/ChatAssistant.java`) rather than in `application.yml`, since the
 yml file is frozen - runtime options merge over the yml defaults per the 1.1 docs,
-so model/temperature are unaffected.
+so model/temperature are unaffected. `ChatAssistant` holds one already-built
+`ChatClient` per provider and picks between them per request based on the
+session's stored provider.
 
-- **Direct, less code.** CorpusAI hand-builds and caches a provider-keyed
-  `OpenAiStreamingChatModel` in `ModelFactory`; here there is no equivalent file.
+- **Direct, less code, for the models themselves.** CorpusAI hand-builds and
+  caches a provider-keyed `ChatModel`/`StreamingChatModel` per
+  provider+model in `ModelFactory`, with an explicit switch expression per
+  provider and a temperature-allowlist for models that reject an explicit
+  value; here both models come from yml alone, no equivalent factory file.
+- **The one place two providers costs real code.** Spring AI's own
+  autoconfigured `ChatClientAutoConfiguration.chatClientBuilder(...)` bean
+  wires a single, unqualified `ChatModel` parameter - confirmed via bytecode
+  inspection of the 1.1.8 autoconfigure jar, and that bean is
+  `@ConditionalOnMissingBean`, not `@ConditionalOnSingleCandidate`, so it
+  doesn't quietly back off once a second `ChatModel` bean exists. With both
+  starters present, that autoconfigured bean becomes ambiguous and the app
+  fails to boot (`NoUniqueBeanDefinitionException`) the moment anything
+  injects a plain `ChatClient.Builder`. `springai/chat/ChatClientConfig.java`
+  builds both builders explicitly from the concrete `OpenAiChatModel`/
+  `AnthropicChatModel` types instead (no ambiguity there - each concrete
+  type has exactly one bean), marking the OpenAI one `@Primary`.
+- **The `@Primary` choice needed zero changes to `RagPipelineFactory`.**
+  CorpusAI's `RetrievalAugmentorFactory` pins RAG query compression to
+  OpenAI unconditionally, regardless of the session's reply provider
+  (`COMPRESSION_PROVIDER = ModelProvider.OPENAI`, with a comment explaining
+  the choice). Mirroring that meant `RagPipelineFactory`'s existing
+  unqualified `ChatClient.Builder chatClientBuilder` constructor parameter
+  didn't need touching at all - `@Primary` on the OpenAI bean makes it
+  resolve there automatically. The rest of the RAG pipeline (#6-#8) is
+  unaffected by the second provider.
+- **A max-tokens default low enough to truncate replies, same as
+  CorpusAI hit on the LangChain4j side.** `AnthropicChatModel
+  .DEFAULT_MAX_TOKENS` is `500` (confirmed via bytecode of the 1.1.8 jar) -
+  Anthropic's API requires `max_tokens` and Spring AI substitutes its own
+  default when unset. CorpusAI's `ModelFactory` comment documents
+  langchain4j's own default of `1024` already truncating chat replies
+  mid-word; Spring AI's default is lower still. Set explicitly to `4096` in
+  `application.yml` (matching CorpusAI's `ANTHROPIC_MAX_TOKENS_CHAT`) rather
+  than discovered the hard way.
+- **Structured output against Anthropic works cleanly in Spring AI, where
+  CorpusAI documents a langchain4j-side limitation for the same case.**
+  CorpusAI's `ModelFactory` comment states that langchain4j 1.10.0 emits a
+  now-rejected `output_format` field for Anthropic's native structured
+  output, so `AiServices` falls back to prompt-based JSON format
+  instructions - and that fallback's collection path is unimplemented, so
+  structured callers must return a single POJO wrapper rather than a bare
+  `List`. Tested the direct parallel live: a temporary probe called
+  `chatClient.prompt().user(...).call().entity(SomeRecord.class)` against
+  the Anthropic `ChatClient`, then the same call with
+  `entity(new ParameterizedTypeReference<List<SomeRecord>>(){})`. Both
+  returned correctly-typed results on the first try, no exception, no
+  `outputFormat`/`outputSchema` option set, including the list case -
+  exactly the scenario the langchain4j-side comment says is unimplemented.
+  The underlying mechanism Spring AI uses for this wasn't inspected further,
+  so this is a working-vs-not-working comparison, not a claim about how
+  either library implements it internally.
 
 ## 5. Declare the assistant, bind the system prompt
 
@@ -264,40 +320,49 @@ log line.
   `comparison_chat_messages` exist. The obligation asks for *recording*, not
   *persistence*, and the automatic Micrometer layer satisfies "whatever Spring
   AI/Micrometer gives you out of the box" without writing anything manual.
-- **Deferred, not done**: `/actuator/metrics/gen_ai.client.token.usage` is not
-  HTTP-reachable without adding `management.endpoints.web.exposure.include` to
-  the frozen `application.yml`. Confirmed live: `/actuator/health` returns 200,
-  `/actuator/metrics` and the specific meter both return 404. Metrics are being
-  recorded either way (Micrometer doesn't need HTTP exposure to record); only
-  the inspection endpoint needs that (not-yet-approved) yml edit.
-- **A real bug the 1.1 docs did not warn about, found only via a live call**:
-  the docs state that non-final streamed chunks carry a usage field "with a
-  null value." Empirically, against a real `gpt-5.4-mini` stream with
-  `streamUsage(true)`, `ChatResponseMetadata.getUsage()` is **never null** -
-  every chunk carries a `Usage` object, populated with zeros until the real
-  final numbers arrive. Checking `usage.getPromptTokens() != null` therefore
-  misclassified every content-bearing chunk as the final one, and the SSE
-  stream sent zero actual token text - a totally silent failure that only a
-  live call surfaces; nothing about it is visible in a type signature or in
-  the docs. Fixed in `ChatAssistant.toStreamEvent()` by checking output text
-  first (empty only on the genuinely final chunk) and requiring the usage
-  numbers to be actually nonzero before treating a chunk as the `done` event.
-  A second, related quirk: the real usage numbers arrived on **two** separate
-  trailing chunks, not one - `ChatAssistant.stream()` now suppresses every
-  `done`-shaped chunk after the first via a per-subscription `AtomicBoolean`,
-  regardless of which of these two behaviors is a `gpt-5.4-mini`-specific
-  quirk versus a general OpenAI streaming quirk.
+- **Confirmed live**: `application.yml` sets
+  `management.endpoints.web.exposure.include: metrics`, and after a real chat
+  call, `/actuator/metrics/gen_ai.client.token.usage` returns real data -
+  `COUNT: 1042` after one exchange, tagged by `gen_ai.operation.name`
+  (`chat` and `embedding` both present, since retrieval and query compression
+  also go through this), `gen_ai.token.type` (`input`/`output`/`total`),
+  request/response model name, and `gen_ai.system`. Before either the yml
+  line existed or any call had been made, the same endpoint 404'd while
+  `/actuator/health` returned 200 - the meter only registers on first use.
+- **A real bug the 1.1 docs did not warn about, found only via a live call -
+  and a heuristic that then broke again on a second provider.** The docs state
+  that non-final streamed chunks carry a usage field "with a null value."
+  Empirically, against a real `gpt-5.4-mini` stream with `streamUsage(true)`,
+  `ChatResponseMetadata.getUsage()` is **never null** - every chunk carries a
+  `Usage` object, populated with zeros until the real final numbers arrive.
+  Checking `usage.getPromptTokens() != null` therefore misclassified every
+  content-bearing chunk as the final one, and the SSE stream sent zero actual
+  token text - a totally silent failure only a live call surfaces. The first
+  fix checked output text first (empty only on the genuinely final chunk) and
+  required the usage numbers to be actually nonzero, plus an `AtomicBoolean`
+  to dedup two separate trailing chunks that both carried real usage.
+  That heuristic then broke immediately once tested live against Anthropic:
+  its *first* chunk already carries real, nonzero prompt-token usage before
+  any content arrives, so the "nonzero usage = done" rule misclassified it
+  as the terminal chunk right away. The final fix (`ChatAssistant.toStreamEvent()`)
+  abandoned usage-based detection entirely in favor of `finishReason` - verified live against both
+  providers, exactly one chunk per stream carries a non-empty finishReason
+  (`"STOP"` for OpenAI, `"end_turn"` for Anthropic), it's always the chunk
+  with the real usage numbers, and every other chunk - including a trailing
+  post-finish chunk both providers send with finishReason reset to null but
+  the same real usage repeated - is correctly ignored. Simpler than the first
+  fix and the `AtomicBoolean` dedup is no longer needed.
 
 ---
 
-## Summary table
+## Summary
 
-| # | Obligation | Equivalence | Workaround needed |
+| # | Area | Equivalence | Workaround needed |
 |---|---|---|---|
 | 1 | Ingestion | Partial | No chunk-overlap param in `TokenTextSplitter`; no single ingestor class |
 | 2 | Vector store | Direct, less code | None |
 | 3 | Embedding model | Direct, less code | None |
-| 4 | Chat model + streaming | Direct, less code | None |
+| 4 | Chat models (OpenAI + Anthropic) + streaming | Direct for the models; `ChatClient.Builder` needs manual wiring for a second provider | `@Primary`/qualified `ChatClient.Builder` beans to resolve a DI ambiguity; explicit Anthropic `max-tokens` |
 | 5 | Assistant + system prompt | Direct, different shape | None |
 | 6 | Filtered retrieval | Direct | None |
 | 7 | Query compression | Direct | None |
@@ -305,4 +370,4 @@ log line.
 | 9 | Memory + persistence | Partial | Append-only `saveAll` (same as CorpusAI); system-prompt workaround and `ChatMemoryRegistry`-equivalent both eliminated |
 | 10 | System prompt | Direct (text identical) | subjectId substitutes for displayName; admin override not replicated (both by scope) |
 | 11 | SSE streaming | Direct | None |
-| 12 | Usage + latency | Direct (read) / automatic (recording) | Usage-chunk detection needed text-first logic + dedup, found live; metrics HTTP endpoint deferred pending yml approval |
+| 12 | Usage + latency | Direct (read) / automatic (recording) | Terminal-chunk detection needed `finishReason`, not usage, found live against both providers; metrics HTTP endpoint confirmed live |
