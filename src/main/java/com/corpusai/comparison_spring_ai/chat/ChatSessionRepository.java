@@ -14,6 +14,7 @@ public class ChatSessionRepository {
             rs.getObject("id", UUID.class),
             rs.getString("subject_id"),
             rs.getString("lang"),
+            ModelProvider.valueOf(rs.getString("provider")),
             rs.getTimestamp("created_at").toInstant(),
             rs.getTimestamp("updated_at").toInstant());
 
@@ -23,17 +24,17 @@ public class ChatSessionRepository {
         this.jdbcTemplate = jdbcTemplate;
     }
 
-    public ChatSession create(String subjectId, String lang) {
+    public ChatSession create(String subjectId, String lang, ModelProvider provider) {
         return jdbcTemplate.queryForObject("""
-                INSERT INTO comparison_chat_sessions (subject_id, lang)
-                VALUES (?, ?)
-                RETURNING id, subject_id, lang, created_at, updated_at
-                """, ROW_MAPPER, subjectId, lang);
+                INSERT INTO comparison_chat_sessions (subject_id, lang, provider)
+                VALUES (?, ?, ?)
+                RETURNING id, subject_id, lang, provider, created_at, updated_at
+                """, ROW_MAPPER, subjectId, lang, provider.name());
     }
 
     public Optional<ChatSession> findById(UUID id) {
         return jdbcTemplate.query("""
-                SELECT id, subject_id, lang, created_at, updated_at
+                SELECT id, subject_id, lang, provider, created_at, updated_at
                 FROM comparison_chat_sessions
                 WHERE id = ?
                 """, ROW_MAPPER, id).stream().findFirst();

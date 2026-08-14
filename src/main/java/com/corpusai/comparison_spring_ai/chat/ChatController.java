@@ -28,6 +28,7 @@ import java.util.UUID;
 public class ChatController {
 
     private static final String DEFAULT_LANG = "en";
+    private static final ModelProvider DEFAULT_PROVIDER = ModelProvider.OPENAI;
     private static final long SSE_TIMEOUT_MS = 300_000L;
 
     private final ChatSessionRepository chatSessionRepository;
@@ -42,8 +43,9 @@ public class ChatController {
     @ResponseStatus(HttpStatus.CREATED)
     public ChatSessionResponse createSession(@RequestBody CreateChatSessionRequest request) {
         String lang = request.lang() != null ? request.lang() : DEFAULT_LANG;
-        ChatSession session = chatSessionRepository.create(request.subjectId(), lang);
-        return new ChatSessionResponse(session.id(), session.subjectId(), session.lang(), session.createdAt());
+        ModelProvider provider = request.provider() != null ? request.provider() : DEFAULT_PROVIDER;
+        ChatSession session = chatSessionRepository.create(request.subjectId(), lang, provider);
+        return new ChatSessionResponse(session.id(), session.subjectId(), session.lang(), session.provider(), session.createdAt());
     }
 
     @PostMapping("/{sessionId}/messages")
@@ -55,7 +57,7 @@ public class ChatController {
         SseEmitter emitter = new SseEmitter(SSE_TIMEOUT_MS);
         Instant startedAt = Instant.now();
 
-        chatAssistant.stream(sessionId, session.subjectId(), session.lang(), request.message())
+        chatAssistant.stream(sessionId, session.subjectId(), session.lang(), session.provider(), request.message())
                 .subscribe(
                         event -> sendEvent(emitter, sessionId, startedAt, event),
                         emitter::completeWithError,
