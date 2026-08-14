@@ -10,6 +10,10 @@ spring:
     init:
       mode: always
       schema-locations: classpath:schema.sql
+  servlet:
+    multipart:
+      max-file-size: 50MB
+      max-request-size: 50MB
   ai:
     openai:
       api-key: ${OPENAI_API_KEY}
