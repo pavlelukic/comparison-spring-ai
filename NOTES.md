@@ -320,13 +320,15 @@ log line.
   `comparison_chat_messages` exist. The obligation asks for *recording*, not
   *persistence*, and the automatic Micrometer layer satisfies "whatever Spring
   AI/Micrometer gives you out of the box" without writing anything manual.
-- **Exposure added, not re-verified live in this pass**: `application.yml` now
-  sets `management.endpoints.web.exposure.include: metrics`, so
-  `/actuator/metrics/gen_ai.client.token.usage` should be HTTP-reachable.
-  Earlier, before this line existed, it was confirmed live to 404 while
-  `/actuator/health` returned 200 - Metrics are recorded by Micrometer either
-  way; only the inspection endpoint needed the yml edit. The edit itself
-  hasn't been re-confirmed against a live boot since landing.
+- **Confirmed live**: `application.yml` sets
+  `management.endpoints.web.exposure.include: metrics`, and after a real chat
+  call, `/actuator/metrics/gen_ai.client.token.usage` returns real data -
+  `COUNT: 1042` after one exchange, tagged by `gen_ai.operation.name`
+  (`chat` and `embedding` both present, since retrieval and query compression
+  also go through this), `gen_ai.token.type` (`input`/`output`/`total`),
+  request/response model name, and `gen_ai.system`. Before either the yml
+  line existed or any call had been made, the same endpoint 404'd while
+  `/actuator/health` returned 200 - the meter only registers on first use.
 - **A real bug the 1.1 docs did not warn about, found only via a live call -
   and a heuristic that then broke again on a second provider.** The docs state
   that non-final streamed chunks carry a usage field "with a null value."
@@ -368,4 +370,4 @@ log line.
 | 9 | Memory + persistence | Partial | Append-only `saveAll` (same as CorpusAI); system-prompt workaround and `ChatMemoryRegistry`-equivalent both eliminated |
 | 10 | System prompt | Direct (text identical) | subjectId substitutes for displayName; admin override not replicated (both by scope) |
 | 11 | SSE streaming | Direct | None |
-| 12 | Usage + latency | Direct (read) / automatic (recording) | Terminal-chunk detection needed `finishReason`, not usage, found live against both providers; metrics HTTP endpoint now exposed via yml, not re-verified live |
+| 12 | Usage + latency | Direct (read) / automatic (recording) | Terminal-chunk detection needed `finishReason`, not usage, found live against both providers; metrics HTTP endpoint confirmed live |
